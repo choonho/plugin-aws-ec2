@@ -244,37 +244,57 @@ def discover_ec2(params):
         _LOGGER.error(traceback.format_exc())
 
 
-def _set_os_distro_env():
-    os_distros = []
-    os_distros.append({'centos': ['centos']})
-    os_distros.append({'ubuntu': ['ubuntu']})
-    os_distros.append({'redhat': ['rhel']})
-    os_distros.append({'debian': ['debian']})
-    os_distros.append({'fedora': ['fedora']})
-    os_distros.append({'suse': ['suse']})
-    os_distros.append({'win2019r2-std': ['windows', '2019', 'r2', 'standard']})
-    os_distros.append({'win2012r2-std': ['windows', '2012', 'r2', 'standard']})
-    os_distros.append({'win2008r2-std': ['windows', '2008', 'r2', 'standard']})
-    os_distros.append({'amazonlinux': ['amazon', 'amzn2', 'ami']})
+def _get_os_distro_env():
+    os_distros = {
+        'linux': [
+            {'centos': ['centos']},
+            {'ubuntu': ['ubuntu']},
+            {'redhat': ['rhel']},
+            {'debian': ['debian']},
+            {'fedora': ['fedora']},
+            {'suse': ['suse']},
+            {'amazonlinux': ['amazon', 'amzn2', 'ami']}
+
+        ],
+        'windows': [
+            {'win2016': ['2016']},
+            {'win2019': ['2019']},
+            {'windows': ['1090', 'ami']},
+            {'win2012r2': ['2012', 'r2']},
+        ]
+    }
     return os_distros
 
 def _get_OS_distro(os, os_type):
     matched_os_distro = None
     if(len(os) > 0):
-        os_distros = _set_os_distro_env()
+        os_distro_info = _get_os_distro_env()
         osl = os.lower()
-        for os_distro in os_distros:
+        os_distros = 'windows' if 'win' in osl else 'linux'
+        count = 0
+        address = None
+        for idx, os_distro in enumerate(os_distro_info[os_distros]):
             os_term = list(os_distro.values())[0]
-            if any(ext in osl for ext in os_term):
-                if(os_term[0] == 'windows' and os_term[1] not in osl):
-                    continue
-                else:
+            if os_distros == 'windows':
+                if 'sql' in osl:
+                    osl = osl[0, osl.find('sql')]
+                encounter = sum(x in osl for x in os_term)
+                if encounter > count:
+                    count = encounter
+                    address = idx
+            else:
+                if any(ext in osl for ext in os_term):
                     matched_os_distro = list(os_distro.keys())[0]
 
-        if (matched_os_distro == None):
-            matched_os_distro = os_type
+        if matched_os_distro == None:
+            if address is not None:
+                os_win = os_distro_info[os_distros][address]
+                matched_os_distro = list(os_win.keys())[0]
+            else:
+                matched_os_distro = os_type.lower()
+
     else:
-        matched_os_distro = os_type
+        matched_os_distro = os_type.lower()
     return matched_os_distro
 
 def _get_image_info(client, ids=None):
@@ -533,6 +553,7 @@ def _list_instances(client, query, instance_ids, region_name, secret_data):
         client_elbv2, resource_elbv2 = _set_connect(secret_data, region_name, "elbv2")
 
         auto_scaling_groups = client_autoscaling.describe_auto_scaling_groups(**autoscaling_query)["AutoScalingGroups"]
+        launch_templates = client_ec2.describe_launch_templates()['LaunchTemplates']
         launch_configurations = client_autoscaling.describe_launch_configurations()["LaunchConfigurations"]
 
         elbs = client_elb.describe_load_balancers()
@@ -555,6 +576,7 @@ def _list_instances(client, query, instance_ids, region_name, secret_data):
     target_group_dic = {}
     elb_dic = {}
     launch_configuration_dic = {}
+    launch_template_dic = {}
     listener_dic ={}
 
     # Find Resources
@@ -601,8 +623,14 @@ def _list_instances(client, query, instance_ids, region_name, secret_data):
         listener_info = client_elbv2.describe_listeners(**listener_query)
         elb_dic[elb_v2["LoadBalancerArn"]]['listeners_info'] = listener_info
 
+    for launch_template in launch_templates:
+        if 'LaunchTemplateName' in launch_templates:
+            launch_template_dic[launch_template['LaunchTemplateName']] = launch_template
+
     for launch_configuration in launch_configurations:
-        launch_configuration_dic[launch_configuration["LaunchConfigurationName"]] = launch_configuration
+        if 'LaunchConfigurationName' in launch_configuration:
+            launch_configuration_dic[launch_configuration["LaunchConfigurationName"]] = launch_configuration
+
 
     image_dic = _get_image_info(client, list(image_dic.keys()))
     volume_dic = _get_volume_info(client, list(volume_dic.keys()))
@@ -651,14 +679,18 @@ def _list_instances(client, query, instance_ids, region_name, secret_data):
                     if asg_instances["InstanceId"] == instance_id:
                         dic["data"]["auto_scaling_group"]["name"] = auto_scaling_group["AutoScalingGroupName"]
                         dic["data"]["auto_scaling_group"]["arn"] = auto_scaling_group["AutoScalingGroupARN"]
+                        scaling_group = dic["data"]["auto_scaling_group"]
                         if "LaunchConfigurationName" in auto_scaling_group.keys():
-                            dic["data"]["auto_scaling_group"]["launch_configuration_name"] = auto_scaling_group[
-                                "LaunchConfigurationName"]
-                            dic["data"]["auto_scaling_group"]["launch_configuration_arn"] = \
-                                launch_configuration_dic[auto_scaling_group[
-                                    "LaunchConfigurationName"]]["LaunchConfigurationARN"]
+                            scaling_group["launch_configuration_name"] = auto_scaling_group.get('LaunchConfigurationName', '')
+                            if auto_scaling_group["LaunchConfigurationName"] in launch_configuration_dic:
+                                scaling_group["launch_configuration_arn"] = \
+                                    launch_configuration_dic[auto_scaling_group["LaunchConfigurationName"]].get("LaunchConfigurationARN",'')
 
-
+                        if "LaunchTemplate" in auto_scaling_group.keys():
+                            scaling_group["launch_template_name"] = auto_scaling_group["LaunchTemplate"].get('LaunchTemplateName', '')
+                            if auto_scaling_group["LaunchTemplate"].get('LaunchTemplateName', '') in launch_template_dic:
+                                scaling_group["launch_template_arn"] = \
+                                    launch_template_dic[auto_scaling_group["LaunchTemplate"].get('LaunchTemplateName', '')]["CreatedBy"]
 
         #############
         # data.os
@@ -666,8 +698,7 @@ def _list_instances(client, query, instance_ids, region_name, secret_data):
         dic['data']['os'] = {}
         dic['data']['os']['os_arch'] = image_info.get('Architecture', '')
         dic['data']['os']['os_distro'] = _get_OS_distro(image_info.get('Name', ''), instance.get('Platform', 'LINUX').upper())
-
-
+        dic['data']['os']['details'] = image_info.get('Name', '')
         
         ################
         # data.compute
@@ -939,9 +970,6 @@ def _list_instances(client, query, instance_ids, region_name, secret_data):
     return resource_list, region_name
 
 
-
-
-
 def _create_metadata():
     """ Create metadata for frontend view
     """
@@ -1105,8 +1133,8 @@ def _create_sub_data():
         'type': 'item',
         'options': {
             'fields': [{'name': 'Auto Scaling Group', 'key': 'data.auto_scaling_group.name'},
-                       {'name': 'Launch Template', 'key': 'data.auto_scaling_group.launch_configuration_name'}
-                       ]
+                       {'name': 'Launch Configuration', 'key': 'data.auto_scaling_group.launch_configuration_name'},
+                       {'name': 'Launch Template', 'key': 'data.auto_scaling_group.launch_template_name'}]
             }
     }
 
